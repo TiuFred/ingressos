@@ -1,0 +1,13 @@
+Monitor U2 - integração com Telegram e possibilidade de feed de estoque autorizado
+
+1. monitor.py mantém a consulta de status geral da Ticketmaster.
+2. Para confirmar disponibilidade nos setores desejados, exige uma fonte AUTORIZADA de estoque (INVENTORY_FEED_URL).
+3. Sem INVENTORY_FEED_URL, NÃO envia mensagens 'ingressos disponíveis'; envia somente alerta rotulado como mudança geral de status.
+4. O feed deve ser uma URL HTTPS de serviço autorizado que retorna snapshot completo de estoque no formato:
+{"offers":[{"event_id":"ZFIMVHtnMZ17a4r3","sale_type":"santander","sector":"Gold Circle","full_available":2,"half_available":1}]}
+5. sale_type pode ser "santander" ou "venda_geral". sector pode ser "Pista Premium A", "Pista Premium B" ou "Gold Circle".
+6. Se as unidades estiverem em setores diferentes, o monitor pode somá-las por data e modalidade.
+7. O sistema evita repetir aviso enquanto a oferta permanece disponível, e avisa novamente após sumir e reaparecer.
+8. O workflow GitHub Actions existente pode rodar esse arquivo sem ajustes, mantendo 5 minutos aproximados (sem SLA).
+9. Para habilitar integração autorizada, configure INVENTORY_FEED_URL e se necessário INVENTORY_FEED_TOKEN como GitHub Actions secrets e os repasse na etapa "Executar monitor" do YAML. NÃO configure URLs inventadas nem cole tokens no código.
+10. O feed do item 4 é um contrato para um provedor autorizado, NÃO é um serviço atualmente disponível.

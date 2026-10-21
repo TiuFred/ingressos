@@ -1,135 +1,127 @@
-import hashlib
+"""Monitor de eventos U2 com alertas verificáveis, via GitHub Actions.
+
+A Discovery API NÃO confirma ingressos disponíveis por setor ou modalidade.
+Opcionalmente, INVENTORY_FEED_URL pode apontar a um feed JSON autorizado
+que informe disponibilidade real no esquema documentado abaixo.
+"""
 import json
 import os
-import re
-from html.parser import HTMLParser
 from pathlib import Path
-
+from datetime import datetime, timezone
 import requests
 
 API_KEY = os.environ['TICKETMASTER_API_KEY']
 BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+INVENTORY_FEED_URL = os.getenv('INVENTORY_FEED_URL', '').strip()
+INVENTORY_FEED_TOKEN = os.getenv('INVENTORY_FEED_TOKEN', '').strip()
 STATE_FILE = Path('state/events.json')
 
-EVENT_IDS = ['ZFIMVHtnMZ17a4r3', 'ZFIMVHtnMZ17a4rK']
-PAGES = {
-    'santander': 'https://www.ticketmaster.com.br/event/pv-santander-u2',
-    'venda_geral': 'https://www.ticketmaster.com.br/event/vg-u2',
-}
-
+EVENTS = {'ZFIMVHtnMZ17a4r3': '10/03/2027', 'ZFIMVHtnMZ17a4rK': '12/03/2027'}
+SECTORS = {'pista premium a', 'pista premium b', 'gold circle'}
+SALE_TYPES = {'santander', 'venda_geral'}
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'U2AvailabilityWatcher/1.0 (+status checking)'})
-
-class VisibleText(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.skip = 0
-        self.parts = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag in ('script', 'style', 'noscript', 'svg'):
-            self.skip += 1
-
-    def handle_endtag(self, tag):
-        if tag in ('script', 'style', 'noscript', 'svg') and self.skip:
-            self.skip -= 1
-
-    def handle_data(self, data):
-        if not self.skip and data.strip():
-            self.parts.append(data.strip())
+SESSION.headers['User-Agent'] = 'U2TicketMonitor/2.0'
 
 
-def notify(message):
-    response = SESSION.post(
-        f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
-        json={'chat_id': CHAT_ID, 'text': message}, timeout=20)
-    response.raise_for_status()
-    if not response.json().get('ok'):
-        raise RuntimeError('Telegram recusou a mensagem')
+def send_telegram(message):
+    r = SESSION.post(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+                     json={'chat_id': CHAT_ID, 'text': message}, timeout=20)
+    r.raise_for_status()
+    if not r.json().get('ok'):
+        raise RuntimeError('Telegram recusou mensagem')
 
 
-def event_state(event):
-    dates = event.get('dates') or {}
-    sales = event.get('sales') or {}
-    public = sales.get('public') or {}
-    presales = []
-    for p in sales.get('presales') or []:
-        name = p.get('name') or ''
-        if 'santander' in name.casefold():
-            presales.append({
-                'name': name,
-                'start': p.get('startDateTime'),
-                'end': p.get('endDateTime'),
-            })
-    presales.sort(key=lambda p: (p['name'], p['start'] or ''))
-    return {
-        'name': event.get('name'),
-        'date': (dates.get('start') or {}).get('localDate'),
-        'status': (dates.get('status') or {}).get('code'),
-        'sales_start': public.get('startDateTime'),
-        'sales_end': public.get('endDateTime'),
-        'presales': presales,
-        'url': event.get('url'),
-    }
+def get_events(state):
+    statuses = state.setdefault('_event_status', {})
+    for event_id, date in EVENTS.items():
+        r = SESSION.get(f'https://app.ticketmaster.com/discovery/v2/events/{event_id}.json',
+                        params={'apikey': API_KEY}, timeout=20)
+        r.raise_for_status()
+        event = r.json()
+        status = (event.get('dates', {}).get('status') or {}).get('code')
+        previous = statuses.get(event_id)
+        if previous and previous != status:
+            send_telegram(f'🎸 U2 — MUDANÇA NO STATUS DE VENDA\n'
+                          f'Data: {date}\n{previous} → {status}\n'
+                          f'Isso NÃO confirma ingressos disponíveis nos setores procurados.\n'
+                          f'https://www.ticketmaster.com.br/event/u2')
+        statuses[event_id] = status
+        print(f'{date}: status geral={status}')
 
 
-def check_events(state):
-    for event_id in EVENT_IDS:
-        resp = SESSION.get(
-            f'https://app.ticketmaster.com/discovery/v2/events/{event_id}.json',
-            params={'apikey': API_KEY}, timeout=20)
-        resp.raise_for_status()
-        current = event_state(resp.json())
-        previous = state.get(event_id)
-        if previous is not None and current != previous:
-            changes = [
-                f'{key}: {previous.get(key)} -> {value}'
-                for key, value in current.items()
-                if previous.get(key) != value
-            ]
-            notify('🎸 U2: MUDANÇA NOS DADOS DE VENDA (NÃO CONFIRMA ESTOQUE)\n'
-                   + f"Show: {current['date']}\n" + '\n'.join(changes)
-                   + '\n' + (current['url'] or ''))
-        state[event_id] = current
-        print(f"Evento {current['date']}: {current['status']}")
+def read_authorized_inventory():
+    """Feed autorizado do operador, sem scraping de checkout ou bypass.
+
+    Contrato esperado:
+    {"offers": [{"event_id": "ZFIMVHtnMZ17a4r3",
+                 "sale_type": "santander", "sector": "Gold Circle",
+                 "full_available": 2, "half_available": 1,
+                 "url": "https://www.ticketmaster.com.br/..."}]}
+    Os números devem representar estoque efetivamente transacionável,
+    não apenas o fato de que a venda está aberta.
+    """
+    if not INVENTORY_FEED_URL:
+        print('Sem feed autorizado de estoque: não é possível confirmar reposição por setor.')
+        return None
+    headers = {'Authorization': f'Bearer {INVENTORY_FEED_TOKEN}'} if INVENTORY_FEED_TOKEN else {}
+    r = SESSION.get(INVENTORY_FEED_URL, headers=headers, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or not isinstance(data.get('offers'), list):
+        raise ValueError('Feed de estoque inválido: esperado objeto com offers[]')
+    return data['offers']
 
 
-def check_pages(state):
-    page_state = state.setdefault('_pages', {})
-    for label, url in PAGES.items():
-        try:
-            response = SESSION.get(url, timeout=20)
-            response.raise_for_status()
-            parser = VisibleText()
-            parser.feed(response.text)
-            text = re.sub(r'\s+', ' ', ' '.join(parser.parts)).strip()
-            if len(text) < 250:
-                print(f'Página {label}: conteúdo insuficiente para comparar')
-                continue
-            # Remove sequências voláteis comuns, mas alterações de layout ainda podem alertar.
-            normalized = re.sub(r'\s+', ' ', text)
-            fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
-            previous = page_state.get(label)
-            if previous is not None and previous != fingerprint:
-                notify(f'🔎 U2: A PÁGINA OFICIAL FOI ALTERADA\n'
-                       f'Modalidade: {label.replace("_", " ").title()}\n'
-                       'Verifique manualmente setores e ingressos. '
-                       'Mudança na página NÃO confirma estoque.\n'
-                       f'{url}')
-            page_state[label] = fingerprint
-            print(f'Página {label}: verificada')
-        except (requests.RequestException, ValueError) as exc:
-            print(f'Página {label}: não foi possível verificar ({type(exc).__name__})')
+def check_inventory(state):
+    offers = read_authorized_inventory()
+    if offers is None:
+        return
+    last = state.setdefault('_confirmed_stock', {})
+    totals = {}
+    for offer in offers:
+        event_id = str(offer.get('event_id', ''))
+        sale = str(offer.get('sale_type', '')).strip().casefold()
+        sector = str(offer.get('sector', '')).strip().casefold()
+        if event_id not in EVENTS or sale not in SALE_TYPES or sector not in SECTORS:
+            continue
+        full = offer.get('full_available')
+        half = offer.get('half_available')
+        if type(full) is not int or type(half) is not int or full < 0 or half < 0:
+            print('Oferta ignorada: quantidade não verificável')
+            continue
+        key = '|'.join((event_id, sale))
+        aggregate = totals.setdefault(key, {'full': 0, 'half': 0, 'sectors': set()})
+        aggregate['full'] += full
+        aggregate['half'] += half
+        if full or half:
+            aggregate['sectors'].add(str(offer['sector']))
+    # Contrato: offers[] é um snapshot completo, não somente mudanças.
+    # Ao sumir a disponibilidade, o estado volta a false para uma futura reposição.
+    for event_id, date in EVENTS.items():
+        for sale in sorted(SALE_TYPES):
+            key = '|'.join((event_id, sale))
+            current = totals.get(key, {'full': 0, 'half': 0, 'sectors': set()})
+            qualifies = current['full'] >= 2 and current['half'] >= 1
+            if qualifies and last.get(key) is not True:
+                send_telegram(
+                    '🚨 U2 — ESTOQUE CONFIRMADO PELO FEED AUTORIZADO\n'
+                    f'Show: {date}\nVenda: {sale}\n'
+                    f'Setores: {", ".join(sorted(current["sectors"]))}\n'
+                    f'Inteiras: {current["full"]} | Meias: {current["half"]}\n'
+                    'Verifique imediatamente: https://www.ticketmaster.com.br/event/u2\n'
+                    'Os ingressos podem esgotar antes da compra.'
+                )
+            last[key] = qualifies
 
 
 def main():
-    state = json.loads(STATE_FILE.read_text(encoding='utf-8')) if STATE_FILE.exists() else {}
-    check_events(state)
-    check_pages(state)
+    state = json.loads(STATE_FILE.read_text('utf-8')) if STATE_FILE.exists() else {}
+    get_events(state)
+    check_inventory(state)
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
-    print('Verificação concluída.')
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + '\n', 'utf-8')
+    print('Verificação finalizada:', datetime.now(timezone.utc).isoformat())
 
 
 if __name__ == '__main__':
