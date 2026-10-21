@@ -5,6 +5,7 @@
     "status": "offsale",
     "sales_start": "2026-10-22T13:00:00Z",
     "sales_end": "2027-03-11T00:00:00Z",
+    "presales": [],
     "url": "https://www.ticketmaster.com.br/event/u2"
   },
   "ZFIMVHtnMZ17a4rK": {
@@ -13,6 +14,7 @@
     "status": "offsale",
     "sales_start": "2026-10-22T13:00:00Z",
     "sales_end": "2027-03-13T00:00:00Z",
+    "presales": [],
     "url": "https://www.ticketmaster.com.br/event/u2"
   }
 }
