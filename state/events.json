@@ -17,5 +17,9 @@
     "presales": [],
     "url": "https://www.ticketmaster.com.br/event/u2"
   },
-  "_pages": {}
+  "_pages": {},
+  "_event_status": {
+    "ZFIMVHtnMZ17a4r3": "offsale",
+    "ZFIMVHtnMZ17a4rK": "offsale"
+  }
 }
