@@ -1,0 +1,16 @@
+name: Teste Agendamento
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "4-59/5 * * * *"
+
+jobs:
+  teste:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirmar execucao
+        run: |
+          echo "Agendamento executado!"
+          date -u
+          echo "Evento: ${{ github.event_name }}"
