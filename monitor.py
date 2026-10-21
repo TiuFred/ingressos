@@ -45,10 +45,47 @@ def fetch_event(event_id):
     return response.json()
 
 
+
 def get_event_state(event):
+    from datetime import datetime, timezone
+
     dates = event.get("dates") or {}
     sales = event.get("sales") or {}
     public_sales = sales.get("public") or {}
+
+    now = datetime.now(timezone.utc)
+    presales = []
+
+    for presale in sales.get("presales") or []:
+        name = presale.get("name") or ""
+
+        # Somente pré-vendas Santander
+        if "santander" not in name.casefold():
+            continue
+
+        start = presale.get("startDateTime")
+        end = presale.get("endDateTime")
+        active = False
+
+        if start and end:
+            start_dt = datetime.fromisoformat(
+                start.replace("Z", "+00:00")
+            )
+            end_dt = datetime.fromisoformat(
+                end.replace("Z", "+00:00")
+            )
+            active = start_dt <= now < end_dt
+
+        presales.append({
+            "name": name,
+            "start": start,
+            "end": end,
+            "active_window": active,
+        })
+
+    presales.sort(key=lambda p: (
+        p["name"], p["start"] or ""
+    ))
 
     return {
         "name": event.get("name"),
@@ -56,6 +93,7 @@ def get_event_state(event):
         "status": (dates.get("status") or {}).get("code"),
         "sales_start": public_sales.get("startDateTime"),
         "sales_end": public_sales.get("endDateTime"),
+        "presales": presales,
         "url": event.get("url"),
     }
 
