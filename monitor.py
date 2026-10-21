@@ -1,214 +1,136 @@
-
+import hashlib
 import json
 import os
+import re
+from html.parser import HTMLParser
 from pathlib import Path
 
 import requests
 
-# =====================================
-# CONFIGURAÇÕES
-# =====================================
+API_KEY = os.environ['TICKETMASTER_API_KEY']
+BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
+CHAT_ID = os.environ['TELEGRAM_CHAT_ID']
+STATE_FILE = Path('state/events.json')
 
-API_KEY = os.environ["TICKETMASTER_API_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+EVENT_IDS = ['ZFIMVHtnMZ17a4r3', 'ZFIMVHtnMZ17a4rK']
+PAGES = {
+    'santander': 'https://www.ticketmaster.com.br/event/pv-santander-u2',
+    'venda_geral': 'https://www.ticketmaster.com.br/event/vg-u2',
+}
 
-# IDs dos shows do U2 em São Paulo
-EVENT_IDS = [
-    "ZFIMVHtnMZ17a4r3",  # 10/03/2027
-    "ZFIMVHtnMZ17a4rK",  # 12/03/2027
-]
+SESSION = requests.Session()
+SESSION.headers.update({'User-Agent': 'U2AvailabilityWatcher/1.0 (+status checking)'})
 
-# Arquivo que armazena o último status
-STATE_FILE = Path("state/events.json")
+class VisibleText(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.skip = 0
+        self.parts = []
 
-session = requests.Session()
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style', 'noscript', 'svg'):
+            self.skip += 1
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style', 'noscript', 'svg') and self.skip:
+            self.skip -= 1
+
+    def handle_data(self, data):
+        if not self.skip and data.strip():
+            self.parts.append(data.strip())
 
 
-# =====================================
-# CONSULTAR TICKETMASTER
-# =====================================
-
-def fetch_event(event_id):
-    url = (
-        "https://app.ticketmaster.com/"
-        f"discovery/v2/events/{event_id}.json"
-    )
-
-    response = session.get(
-        url,
-        params={"apikey": API_KEY},
-        timeout=20,
-    )
-
+def notify(message):
+    response = SESSION.post(
+        f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage',
+        json={'chat_id': CHAT_ID, 'text': message}, timeout=20)
     response.raise_for_status()
-    return response.json()
+    if not response.json().get('ok'):
+        raise RuntimeError('Telegram recusou a mensagem')
 
 
-
-def get_event_state(event):
-    from datetime import datetime, timezone
-
-    dates = event.get("dates") or {}
-    sales = event.get("sales") or {}
-    public_sales = sales.get("public") or {}
-
-    now = datetime.now(timezone.utc)
+def event_state(event):
+    dates = event.get('dates') or {}
+    sales = event.get('sales') or {}
+    public = sales.get('public') or {}
     presales = []
-
-    for presale in sales.get("presales") or []:
-        name = presale.get("name") or ""
-
-        # Somente pré-vendas Santander
-        if "santander" not in name.casefold():
-            continue
-
-        start = presale.get("startDateTime")
-        end = presale.get("endDateTime")
-        active = False
-
-        if start and end:
-            start_dt = datetime.fromisoformat(
-                start.replace("Z", "+00:00")
-            )
-            end_dt = datetime.fromisoformat(
-                end.replace("Z", "+00:00")
-            )
-            active = start_dt <= now < end_dt
-
-        presales.append({
-            "name": name,
-            "start": start,
-            "end": end,
-            "active_window": active,
-        })
-
-    presales.sort(key=lambda p: (
-        p["name"], p["start"] or ""
-    ))
-
+    for p in sales.get('presales') or []:
+        name = p.get('name') or ''
+        if 'santander' in name.casefold():
+            presales.append({
+                'name': name,
+                'start': p.get('startDateTime'),
+                'end': p.get('endDateTime'),
+            })
+    presales.sort(key=lambda p: (p['name'], p['start'] or ''))
     return {
-        "name": event.get("name"),
-        "date": (dates.get("start") or {}).get("localDate"),
-        "status": (dates.get("status") or {}).get("code"),
-        "sales_start": public_sales.get("startDateTime"),
-        "sales_end": public_sales.get("endDateTime"),
-        "presales": presales,
-        "url": event.get("url"),
+        'name': event.get('name'),
+        'date': (dates.get('start') or {}).get('localDate'),
+        'status': (dates.get('status') or {}).get('code'),
+        'sales_start': public.get('startDateTime'),
+        'sales_end': public.get('endDateTime'),
+        'presales': presales,
+        'url': event.get('url'),
     }
 
 
-# =====================================
-# ENVIAR ALERTA PELO TELEGRAM
-# =====================================
-
-def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{BOT_TOKEN}/sendMessage"
-    )
-
-    response = session.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-        },
-        timeout=20,
-    )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError("Telegram recusou a mensagem")
+def check_events(state):
+    for event_id in EVENT_IDS:
+        resp = SESSION.get(
+            f'https://app.ticketmaster.com/discovery/v2/events/{event_id}.json',
+            params={'apikey': API_KEY}, timeout=20)
+        resp.raise_for_status()
+        current = event_state(resp.json())
+        previous = state.get(event_id)
+        if previous is not None and current != previous:
+            changes = [
+                f'{key}: {previous.get(key)} -> {value}'
+                for key, value in current.items()
+                if previous.get(key) != value
+            ]
+            notify('🎸 U2: MUDANÇA NOS DADOS DE VENDA (NÃO CONFIRMA ESTOQUE)\n'
+                   + f"Show: {current['date']}\n" + '\n'.join(changes)
+                   + '\n' + (current['url'] or ''))
+        state[event_id] = current
+        print(f"Evento {current['date']}: {current['status']}")
 
 
-# =====================================
-# ARMAZENAR STATUS DOS EVENTOS
-# =====================================
+def check_pages(state):
+    page_state = state.setdefault('_pages', {})
+    for label, url in PAGES.items():
+        try:
+            response = SESSION.get(url, timeout=20)
+            response.raise_for_status()
+            parser = VisibleText()
+            parser.feed(response.text)
+            text = re.sub(r'\s+', ' ', ' '.join(parser.parts)).strip()
+            if len(text) < 250:
+                print(f'Página {label}: conteúdo insuficiente para comparar')
+                continue
+            # Remove sequências voláteis comuns, mas alterações de layout ainda podem alertar.
+            normalized = re.sub(r'\s+', ' ', text)
+            fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
+            previous = page_state.get(label)
+            if previous is not None and previous != fingerprint:
+                notify(f'🔎 U2: A PÁGINA OFICIAL FOI ALTERADA\n'
+                       f'Modalidade: {label.replace("_", " ").title()}\n'
+                       'Verifique manualmente setores e ingressos. '
+                       'Mudança na página NÃO confirma estoque.\n'
+                       f'{url}')
+            page_state[label] = fingerprint
+            print(f'Página {label}: verificada')
+        except (requests.RequestException, ValueError) as exc:
+            print(f'Página {label}: não foi possível verificar ({type(exc).__name__})')
 
-def load_state():
-    if not STATE_FILE.exists():
-        return {}
-
-    return json.loads(
-        STATE_FILE.read_text(encoding="utf-8")
-    )
-
-
-def save_state(state):
-    STATE_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    STATE_FILE.write_text(
-        json.dumps(
-            state,
-            indent=2,
-            ensure_ascii=False
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-
-# =====================================
-# MONITORAMENTO
-# =====================================
 
 def main():
-    print("Iniciando monitoramento do U2...")
-
-    old_state = load_state()
-    new_state = old_state.copy()
-
-    for event_id in EVENT_IDS:
-        event = fetch_event(event_id)
-        current = get_event_state(event)
-        previous = old_state.get(event_id)
-
-        print(
-            f"Evento {event_id}: "
-            f"{current['date']} - {current['status']}"
-        )
-
-        # Primeira execução: registra o estado
-        if previous is None:
-            print("Registrando estado inicial.")
-            new_state[event_id] = current
-            continue
-
-        # Detecta alterações
-        if current != previous:
-            changes = []
-
-            for key, value in current.items():
-                if value != previous.get(key):
-                    changes.append(
-                        f"{key}: "
-                        f"{previous.get(key)} -> {value}"
-                    )
-
-            message = (
-                "🎸 U2 - ALTERAÇÃO DETECTADA!\n\n"
-                f"Evento: {current['name']}\n"
-                f"Data: {current['date']}\n\n"
-                + "\n".join(changes)
-                + f"\n\n{current['url']}"
-            )
-
-            send_telegram(message)
-
-            print("Alerta enviado ao Telegram!")
-
-        new_state[event_id] = current
-
-    save_state(new_state)
-
-    print("Monitoramento concluído!")
+    state = json.loads(STATE_FILE.read_text(encoding='utf-8')) if STATE_FILE.exists() else {}
+    check_events(state)
+    check_pages(state)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    print('Verificação concluída.')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
